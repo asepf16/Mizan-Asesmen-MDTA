@@ -1,0 +1,6 @@
+{
+  "name": "Mizan Asesmen MDTA PERSIS",
+  "description": "Penyusun Kisi-Kisi dan Paket Soal Penilaian Sumatif berbasis AKM & HOTS berlandaskan Kurikulum Madrasah Diniyah Takmiliyah Awaliyah (MDTA) Persatuan Islam.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
