@@ -69,6 +69,7 @@ export default function App() {
   const [customInstruction, setCustomInstruction] = useState<string>('');
 
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [generationStatus, setGenerationStatus] = useState<string | null>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [isCurriculumModalOpen, setIsCurriculumModalOpen] =
     useState<boolean>(false);
@@ -136,6 +137,7 @@ export default function App() {
 
   const handleGenerate = async () => {
     setIsGenerating(true);
+    setGenerationStatus('Menghubungi layanan penyusun soal...');
     setGenerationError(null);
 
     try {
@@ -150,21 +152,89 @@ export default function App() {
           distribution,
           selectedUnitCodes,
           customInstruction,
+          stream: true,
         }),
       });
 
-      const payload = (await response.json()) as {
-        package?: AssessmentPackage;
-        error?: string;
-      };
+      const contentType = response.headers.get('content-type') ?? '';
+      let finalPackage: AssessmentPackage | undefined;
 
-      if (!response.ok || !payload.package) {
+      if (contentType.includes('application/x-ndjson') && response.body) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        const processLine = (line: string) => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          let event: {
+            type?: string;
+            message?: string;
+            package?: AssessmentPackage;
+            error?: string;
+          };
+          try {
+            event = JSON.parse(trimmed);
+          } catch {
+            throw new Error(
+              'Respons server terputus di tengah proses (bukan JSON valid). Silakan coba lagi.'
+            );
+          }
+
+          if (event.type === 'status' && event.message) {
+            setGenerationStatus(event.message);
+          } else if (event.type === 'error') {
+            throw new Error(
+              event.error || 'Gagal menyusun paket soal dari layanan server.'
+            );
+          } else if (event.type === 'result' && event.package) {
+            finalPackage = event.package;
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            processLine(line);
+          }
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) {
+          processLine(buffer);
+        }
+      } else {
+        const rawText = await response.text();
+        let payload: { package?: AssessmentPackage; error?: string } | null = null;
+        try {
+          payload = JSON.parse(rawText) as {
+            package?: AssessmentPackage;
+            error?: string;
+          };
+        } catch {
+          throw new Error(
+            'Koneksi ke server terputus atau waktu tunggu gateway habis sebelum jawaban diterima. Silakan coba lagi atau kurangi jumlah butir soal dalam satu paket.'
+          );
+        }
+
+        if (!response.ok || !payload?.package) {
+          throw new Error(
+            payload?.error || 'Gagal menyusun paket soal dari layanan server.'
+          );
+        }
+        finalPackage = payload.package;
+      }
+
+      if (!finalPackage) {
         throw new Error(
-          payload.error || 'Gagal menyusun paket soal dari layanan server.'
+          'Paket soal belum lengkap diterima dari server. Silakan coba klik "Susun Paket Soal" kembali.'
         );
       }
 
-      setActivePackage(payload.package);
+      setActivePackage(finalPackage);
       setActiveTab('naskah_soal');
     } catch (err: unknown) {
       setGenerationError(
@@ -174,6 +244,7 @@ export default function App() {
       );
     } finally {
       setIsGenerating(false);
+      setGenerationStatus(null);
     }
   };
 
@@ -271,6 +342,7 @@ export default function App() {
             customInstruction={customInstruction}
             onChangeCustomInstruction={setCustomInstruction}
             isGenerating={isGenerating}
+            generationStatus={generationStatus}
             generationError={generationError}
             onGenerate={handleGenerate}
             samplePackages={SAMPLE_PACKAGES}

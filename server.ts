@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import { CURRICULUM_DATA, SUBJECT_META } from './src/data/curriculumMdta.ts';
 import type {
@@ -197,6 +197,7 @@ async function startServer() {
         distribution,
         selectedUnitCodes,
         customInstruction = '',
+        stream = false,
       } = req.body as {
         kelas: GradeLevel;
         subjectId: SubjectId;
@@ -206,6 +207,7 @@ async function startServer() {
         distribution?: QuestionDistribution;
         selectedUnitCodes?: string[];
         customInstruction?: string;
+        stream?: boolean;
       };
 
       const gradeNum = Number(kelas) as GradeLevel;
@@ -401,7 +403,7 @@ Pastikan:
 4. Pada metadata: jenjang harus "Diniyah Ula", kelas harus ${gradeNum}, fase_asesmen harus "${isLowerPhase ? 'AKM_DASAR_LOTS_MOTS' : 'AKM_MENENGAH_HOTS'}", subject_id harus "${curriculum.subject_id}", mata_pelajaran harus "${curriculum.mata_pelajaran}", tanggal_disusun gunakan "2026-11-26".`;
 
       const systemInstruction =
-        'Anda adalah Pakar Pengembangan Asesmen Pembelajaran Madrasah Diniyah Takmiliyah Awaliyah (MDTA) Persatuan Islam (PERSIS). Anda menyusun kisi-kisi dan soal AKM/HOTS secara akurat, beradab, sesuai manhaj dalil Al-Qur\'an dan Sunnah pada Kurikulum MDTA PERSIS, dan mengeluarkan JSON valid sesuai schema.';
+        'Anda adalah Pakar Pengembangan Asesmen Pembelajaran Madrasah Diniyah Takmiliyah Awaliyah (MDTA) Persatuan Islam (PERSIS). Anda menyusun kisi-kisi dan soal AKM/HOTS secara akurat, beradab, sesuai manhaj dalil Al-Qur\'an dan Sunnah pada Kurikulum MDTA PERSIS, dan mengeluarkan JSON valid sesuai schema secara ringkas namun lengkap.';
 
       const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
       let rawText = '';
@@ -416,57 +418,151 @@ Pastikan:
           msg.includes('UNAVAILABLE') ||
           msg.includes('high demand') ||
           msg.includes('502') ||
+          msg.includes('504') ||
           msg.includes('500') ||
           msg.includes('429') ||
           msg.includes('RESOURCE_EXHAUSTED')
         );
       };
 
-      for (const modelName of modelsToTry) {
-        const maxAttempts = 2;
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          try {
-            const response = await ai.models.generateContent({
-              model: modelName,
-              contents: prompt,
-              config: {
+      const writeNdjson = (obj: Record<string, unknown>) => {
+        if (stream && !res.writableEnded) {
+          res.write(`${JSON.stringify(obj)}\n`);
+        }
+      };
+
+      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+      if (stream) {
+        req.setTimeout(0);
+        res.setTimeout(0);
+        res.status(200);
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('X-Accel-Buffering', 'no');
+        if (typeof res.flushHeaders === 'function') {
+          res.flushHeaders();
+        }
+        writeNdjson({
+          type: 'status',
+          message: `Menyusun ${totalRequested} butir soal ${curriculum.mata_pelajaran}...`,
+        });
+        heartbeatTimer = setInterval(() => {
+          writeNdjson({ type: 'ping', ts: Date.now() });
+        }, 2000);
+        res.on('close', () => {
+          if (heartbeatTimer) {
+            clearInterval(heartbeatTimer);
+            heartbeatTimer = null;
+          }
+        });
+      }
+
+      try {
+        for (const modelName of modelsToTry) {
+          const maxAttempts = modelName === 'gemini-4-hydrogen' ? 1 : 2;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              if (modelName !== modelsToTry[0] && attempt === 1) {
+                writeNdjson({
+                  type: 'status',
+                  message: 'Mengalihkan ke model cadangan yang lebih cepat...',
+                });
+              }
+
+              const modelConfig = {
                 systemInstruction,
                 responseMimeType: 'application/json',
                 responseSchema: ASSESSMENT_RESPONSE_SCHEMA,
-              },
-            });
+                ...(modelName === 'gemini-4-hydrogen'
+                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                  : {}),
+              };
 
-            const candidateText = (response.text ?? '').trim();
-            if (candidateText) {
-              rawText = candidateText;
-              break;
-            }
-            lastError = new Error('Model mengembalikan respons kosong.');
-          } catch (err: unknown) {
-            lastError = err;
-            console.warn(
-              `Attempt ${attempt}/${maxAttempts} failed for ${modelName}:`,
-              err instanceof Error ? err.message : err
-            );
-            if (!isTransientError(err)) {
-              break;
-            }
-            if (attempt < maxAttempts) {
-              await sleep(1200 * attempt);
+              if (stream) {
+                const responseStream = await ai.models.generateContentStream({
+                  model: modelName,
+                  contents: prompt,
+                  config: modelConfig,
+                });
+
+                let accumulated = '';
+                let chunkCounter = 0;
+                for await (const chunk of responseStream) {
+                  const part = chunk.text ?? '';
+                  if (part) {
+                    accumulated += part;
+                    chunkCounter += 1;
+                    if (chunkCounter % 4 === 0) {
+                      writeNdjson({
+                        type: 'progress',
+                        chars: accumulated.length,
+                      });
+                    }
+                  }
+                }
+                const candidateText = accumulated.trim();
+                if (candidateText) {
+                  // Validate complete JSON before breaking out of fallback loop
+                  JSON.parse(candidateText);
+                  rawText = candidateText;
+                  break;
+                }
+              } else {
+                const response = await ai.models.generateContent({
+                  model: modelName,
+                  contents: prompt,
+                  config: modelConfig,
+                });
+
+                const candidateText = (response.text ?? '').trim();
+                if (candidateText) {
+                  JSON.parse(candidateText);
+                  rawText = candidateText;
+                  break;
+                }
+              }
+              lastError = new Error('Model mengembalikan respons kosong.');
+            } catch (err: unknown) {
+              lastError = err;
+              console.warn(
+                `Attempt ${attempt}/${maxAttempts} failed for ${modelName}:`,
+                err instanceof Error ? err.message : err
+              );
+              const isSyntax = err instanceof SyntaxError;
+              if (!isTransientError(err) && !isSyntax) {
+                break;
+              }
+              if (attempt < maxAttempts) {
+                writeNdjson({
+                  type: 'status',
+                  message: 'Model AI sedang padat, mencoba ulang otomatis...',
+                });
+                await sleep(1000 * attempt);
+              }
             }
           }
+          if (rawText) {
+            break;
+          }
         }
-        if (rawText) {
-          break;
+
+        if (!rawText) {
+          throw lastError ?? new Error('Model tidak mengembalikan output JSON.');
+        }
+
+        const parsed = JSON.parse(rawText) as AssessmentPackage;
+        if (stream) {
+          writeNdjson({ type: 'result', package: parsed });
+          res.end();
+        } else {
+          res.json({ package: parsed });
+        }
+      } finally {
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
         }
       }
-
-      if (!rawText) {
-        throw lastError ?? new Error('Model tidak mengembalikan output JSON.');
-      }
-
-      const parsed = JSON.parse(rawText) as AssessmentPackage;
-      res.json({ package: parsed });
     } catch (error: unknown) {
       console.error('Error generating assessment package:', error);
       const rawMsg = error instanceof Error ? error.message : String(error);
@@ -482,7 +578,7 @@ Pastikan:
       ) {
         statusCode = 503;
         friendlyMessage =
-          'Layanan model AI sedang mengalami lonjakan trafik sementara (503). Sistem sudah mencoba ulang otomatis dan berpindah model cadangan—silakan klik "Susun Paket Soal AKM/HOTS" kembali dalam beberapa detik.';
+          'Layanan model AI sedang mengalami lonjakan trafik sementara (503). Sistem sudah mencoba ulang otomatis dan berpindah model cadangan—silakan klik "Susun Paket Soal" kembali dalam beberapa detik.';
       } else if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) {
         statusCode = 429;
         friendlyMessage =
@@ -499,7 +595,16 @@ Pastikan:
         friendlyMessage = rawMsg;
       }
 
-      res.status(statusCode).json({ error: friendlyMessage });
+      if (res.headersSent) {
+        if (!res.writableEnded) {
+          res.write(
+            `${JSON.stringify({ type: 'error', status: statusCode, error: friendlyMessage })}\n`
+          );
+          res.end();
+        }
+      } else {
+        res.status(statusCode).json({ error: friendlyMessage });
+      }
     }
   });
 

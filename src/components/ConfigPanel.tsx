@@ -36,6 +36,7 @@ interface ConfigPanelProps {
   customInstruction: string;
   onChangeCustomInstruction: (value: string) => void;
   isGenerating: boolean;
+  generationStatus?: string | null;
   generationError: string | null;
   onGenerate: () => void;
   samplePackages: AssessmentPackage[];
@@ -63,6 +64,7 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
   customInstruction,
   onChangeCustomInstruction,
   isGenerating,
+  generationStatus,
   generationError,
   onGenerate,
   samplePackages,
@@ -403,8 +405,10 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
         >
           {isGenerating ? (
             <>
-              <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
-              Menyusun Kisi-Kisi &amp; {totalQuestions} Soal...
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" aria-hidden="true" />
+              <span className="truncate">
+                {generationStatus || `Menyusun Kisi-Kisi & ${totalQuestions} Soal...`}
+              </span>
             </>
           ) : (
             <>
