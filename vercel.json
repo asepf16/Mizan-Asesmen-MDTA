@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/assessments/generate.ts": {
+      "maxDuration": 60
+    }
+  }
+}

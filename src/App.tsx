@@ -170,6 +170,73 @@ export default function App() {
         }),
       });
 
+      const contentType = startRes.headers.get('content-type') ?? '';
+
+      if (contentType.includes('application/x-ndjson') && startRes.body) {
+        const reader = startRes.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let streamedPackage: AssessmentPackage | undefined;
+
+        const processLine = (line: string) => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          let event: {
+            type?: string;
+            message?: string;
+            chars?: number;
+            package?: AssessmentPackage;
+            error?: string;
+          };
+          try {
+            event = JSON.parse(trimmed);
+          } catch {
+            throw new Error(
+              'Respons streaming dari server terputus di tengah proses. Silakan coba lagi.'
+            );
+          }
+
+          if (event.type === 'status' && event.message) {
+            setGenerationStatus(event.message);
+          } else if (event.type === 'progress' && event.chars) {
+            setGenerationStatus(
+              `Menyusun paket soal... (${Math.round(event.chars / 100) / 10} KB)`
+            );
+          } else if (event.type === 'error') {
+            throw new Error(
+              event.error || 'Gagal menyusun paket soal dari layanan server.'
+            );
+          } else if (event.type === 'result' && event.package) {
+            streamedPackage = event.package;
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            processLine(line);
+          }
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) {
+          processLine(buffer);
+        }
+
+        if (!streamedPackage) {
+          throw new Error(
+            'Paket soal belum lengkap diterima dari server. Silakan coba klik "Susun Paket Soal" kembali.'
+          );
+        }
+
+        setActivePackage(streamedPackage);
+        setActiveTab('naskah_soal');
+        return;
+      }
+
       const startPayload = await parseJsonSafe<{
         jobId?: string;
         message?: string;
