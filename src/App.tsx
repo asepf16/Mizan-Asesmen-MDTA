@@ -140,8 +140,22 @@ export default function App() {
     setGenerationStatus('Menghubungi layanan penyusun soal...');
     setGenerationError(null);
 
+    const parseJsonSafe = async <T,>(response: Response): Promise<T> => {
+      const rawText = await response.text();
+      try {
+        return JSON.parse(rawText) as T;
+      } catch {
+        const snippet = rawText.replace(/\s+/g, ' ').trim().slice(0, 100);
+        throw new Error(
+          `Respons server bukan JSON (HTTP ${response.status}${
+            snippet ? `: "${snippet}"` : ''
+          }). Silakan coba klik "Susun Paket Soal" kembali.`
+        );
+      }
+    };
+
     try {
-      const response = await fetch('/api/assessments/generate', {
+      const startRes = await fetch('/api/assessments/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -152,85 +166,117 @@ export default function App() {
           distribution,
           selectedUnitCodes,
           customInstruction,
-          stream: true,
+          async: true,
         }),
       });
 
-      const contentType = response.headers.get('content-type') ?? '';
+      const startPayload = await parseJsonSafe<{
+        jobId?: string;
+        message?: string;
+        package?: AssessmentPackage;
+        error?: string;
+      }>(startRes);
+
+      if (!startRes.ok) {
+        throw new Error(
+          startPayload.error ||
+            `Gagal memulai penyusunan soal (HTTP ${startRes.status}).`
+        );
+      }
+
+      if (startPayload.package) {
+        setActivePackage(startPayload.package);
+        setActiveTab('naskah_soal');
+        return;
+      }
+
+      const jobId = startPayload.jobId;
+      if (!jobId) {
+        throw new Error('Server tidak mengembalikan ID antrean penyusunan soal.');
+      }
+
+      if (startPayload.message) {
+        setGenerationStatus(startPayload.message);
+      }
+
       let finalPackage: AssessmentPackage | undefined;
+      const startedAt = Date.now();
+      let consecutivePollErrors = 0;
 
-      if (contentType.includes('application/x-ndjson') && response.body) {
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
+      while (Date.now() - startedAt < 180000) {
+        await new Promise((resolve) => setTimeout(resolve, 1200));
 
-        const processLine = (line: string) => {
-          const trimmed = line.trim();
-          if (!trimmed) return;
-          let event: {
-            type?: string;
-            message?: string;
-            package?: AssessmentPackage;
-            error?: string;
-          };
-          try {
-            event = JSON.parse(trimmed);
-          } catch {
-            throw new Error(
-              'Respons server terputus di tengah proses (bukan JSON valid). Silakan coba lagi.'
-            );
+        let pollRes: Response;
+        try {
+          pollRes = await fetch(
+            `/api/assessments/jobs/${encodeURIComponent(jobId)}`,
+            {
+              method: 'GET',
+              cache: 'no-store',
+              signal: AbortSignal.timeout(12000),
+            }
+          );
+        } catch (netErr) {
+          consecutivePollErrors += 1;
+          if (consecutivePollErrors >= 4) {
+            throw netErr instanceof Error
+              ? netErr
+              : new Error('Koneksi jaringan ke server terputus.');
           }
+          continue;
+        }
 
-          if (event.type === 'status' && event.message) {
-            setGenerationStatus(event.message);
-          } else if (event.type === 'error') {
-            throw new Error(
-              event.error || 'Gagal menyusun paket soal dari layanan server.'
-            );
-          } else if (event.type === 'result' && event.package) {
-            finalPackage = event.package;
-          }
+        let jobPayload: {
+          status?: 'pending' | 'done' | 'error';
+          message?: string;
+          chars?: number;
+          package?: AssessmentPackage;
+          error?: string;
         };
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
-          for (const line of lines) {
-            processLine(line);
-          }
-        }
-        buffer += decoder.decode();
-        if (buffer.trim()) {
-          processLine(buffer);
-        }
-      } else {
-        const rawText = await response.text();
-        let payload: { package?: AssessmentPackage; error?: string } | null = null;
         try {
-          payload = JSON.parse(rawText) as {
-            package?: AssessmentPackage;
-            error?: string;
-          };
-        } catch {
+          jobPayload = await parseJsonSafe(pollRes);
+          consecutivePollErrors = 0;
+        } catch (parseErr) {
+          consecutivePollErrors += 1;
+          if (consecutivePollErrors >= 3) {
+            throw parseErr;
+          }
+          continue;
+        }
+
+        if (!pollRes.ok) {
           throw new Error(
-            'Koneksi ke server terputus atau waktu tunggu gateway habis sebelum jawaban diterima. Silakan coba lagi atau kurangi jumlah butir soal dalam satu paket.'
+            jobPayload.error ||
+              `Gagal memeriksa status penyusunan (HTTP ${pollRes.status}).`
           );
         }
 
-        if (!response.ok || !payload?.package) {
+        if (jobPayload.status === 'done' && jobPayload.package) {
+          finalPackage = jobPayload.package;
+          break;
+        }
+
+        if (jobPayload.status === 'error') {
           throw new Error(
-            payload?.error || 'Gagal menyusun paket soal dari layanan server.'
+            jobPayload.error || 'Gagal menyusun paket soal dari layanan server.'
           );
         }
-        finalPackage = payload.package;
+
+        if (jobPayload.chars && jobPayload.chars > 0) {
+          setGenerationStatus(
+            `${jobPayload.message || 'Menyusun paket soal...'} (${Math.round(
+              jobPayload.chars / 100
+            ) / 10} KB)`
+          );
+        } else if (jobPayload.message) {
+          setGenerationStatus(jobPayload.message);
+        }
       }
 
       if (!finalPackage) {
         throw new Error(
-          'Paket soal belum lengkap diterima dari server. Silakan coba klik "Susun Paket Soal" kembali.'
+          'Proses penyusunan soal melampaui batas waktu tunggu. Silakan coba lagi atau kurangi jumlah butir soal.'
         );
       }
 

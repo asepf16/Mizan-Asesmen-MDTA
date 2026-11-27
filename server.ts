@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -17,7 +18,65 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+
+interface AssessmentJob {
+  id: string;
+  status: 'pending' | 'done' | 'error';
+  message: string;
+  chars: number;
+  package?: AssessmentPackage;
+  error?: string;
+  statusCode?: number;
+  createdAt: number;
+}
+
+const assessmentJobs = new Map<string, AssessmentJob>();
+
+function pruneOldJobs() {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [id, job] of assessmentJobs.entries()) {
+    if (job.createdAt < cutoff) {
+      assessmentJobs.delete(id);
+    }
+  }
+}
+
+function mapFriendlyAiError(error: unknown): {
+  statusCode: number;
+  friendlyMessage: string;
+} {
+  const rawMsg = error instanceof Error ? error.message : String(error);
+  let statusCode = 500;
+  let friendlyMessage =
+    'Terjadi kesalahan saat menyusun paket soal dengan layanan AI.';
+
+  if (
+    rawMsg.includes('503') ||
+    rawMsg.includes('UNAVAILABLE') ||
+    rawMsg.includes('high demand')
+  ) {
+    statusCode = 503;
+    friendlyMessage =
+      'Layanan model AI sedang mengalami lonjakan trafik sementara (503). Sistem sudah mencoba ulang otomatis dan berpindah model cadangan—silakan klik "Susun Paket Soal" kembali dalam beberapa detik.';
+  } else if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) {
+    statusCode = 429;
+    friendlyMessage =
+      'Batas kuota permintaan AI sementara tercapai (429). Silakan tunggu sebentar lalu coba lagi, atau periksa kunci API di panel Settings > Secrets.';
+  } else if (
+    rawMsg.includes('API_KEY_INVALID') ||
+    rawMsg.includes('PERMISSION_DENIED') ||
+    rawMsg.includes('403')
+  ) {
+    statusCode = 403;
+    friendlyMessage =
+      'Kunci API tidak valid atau tidak memiliki izin akses. Silakan periksa GEMINI_API_KEY di panel Settings > Secrets.';
+  } else if (rawMsg) {
+    friendlyMessage = rawMsg;
+  }
+
+  return { statusCode, friendlyMessage };
+}
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -178,6 +237,29 @@ async function startServer() {
     res.json({ status: 'ok', service: 'mizan-asesmen-mdta' });
   });
 
+  app.get('/api/assessments/jobs/:jobId', (req, res) => {
+    pruneOldJobs();
+    const job = assessmentJobs.get(req.params.jobId);
+    res.setHeader('Cache-Control', 'no-store');
+    if (!job) {
+      res.status(404).json({
+        error:
+          'Sesi penyusunan soal tidak ditemukan atau telah kedaluwarsa. Silakan klik "Susun Paket Soal" kembali.',
+      });
+      return;
+    }
+    res.json({
+      jobId: job.id,
+      status: job.status,
+      message: job.message,
+      chars: job.chars,
+      ...(job.status === 'done' && job.package ? { package: job.package } : {}),
+      ...(job.status === 'error'
+        ? { error: job.error, statusCode: job.statusCode ?? 500 }
+        : {}),
+    });
+  });
+
   app.post('/api/assessments/generate', async (req, res) => {
     try {
       if (!process.env.GEMINI_API_KEY) {
@@ -198,6 +280,7 @@ async function startServer() {
         selectedUnitCodes,
         customInstruction = '',
         stream = false,
+        async: asyncMode = false,
       } = req.body as {
         kelas: GradeLevel;
         subjectId: SubjectId;
@@ -208,6 +291,7 @@ async function startServer() {
         selectedUnitCodes?: string[];
         customInstruction?: string;
         stream?: boolean;
+        async?: boolean;
       };
 
       const gradeNum = Number(kelas) as GradeLevel;
@@ -406,9 +490,6 @@ Pastikan:
         'Anda adalah Pakar Pengembangan Asesmen Pembelajaran Madrasah Diniyah Takmiliyah Awaliyah (MDTA) Persatuan Islam (PERSIS). Anda menyusun kisi-kisi dan soal AKM/HOTS secara akurat, beradab, sesuai manhaj dalil Al-Qur\'an dan Sunnah pada Kurikulum MDTA PERSIS, dan mengeluarkan JSON valid sesuai schema secara ringkas namun lengkap.';
 
       const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
-      let rawText = '';
-      let lastError: unknown = null;
-
       const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
       const isTransientError = (err: unknown): boolean => {
@@ -424,6 +505,145 @@ Pastikan:
           msg.includes('RESOURCE_EXHAUSTED')
         );
       };
+
+      const executeGeneration = async (callbacks?: {
+        onStatus?: (message: string) => void;
+        onProgress?: (chars: number) => void;
+      }): Promise<AssessmentPackage> => {
+        let rawText = '';
+        let lastError: unknown = null;
+
+        for (const modelName of modelsToTry) {
+          const maxAttempts = modelName === 'gemini-4-hydrogen' ? 1 : 2;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              if (modelName !== modelsToTry[0] && attempt === 1) {
+                callbacks?.onStatus?.(
+                  'Mengalihkan ke model cadangan yang lebih cepat...'
+                );
+              }
+
+              const modelConfig = {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                responseSchema: ASSESSMENT_RESPONSE_SCHEMA,
+                ...(modelName === 'gemini-4-hydrogen'
+                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                  : {}),
+              };
+
+              if (callbacks?.onProgress) {
+                const responseStream = await ai.models.generateContentStream({
+                  model: modelName,
+                  contents: prompt,
+                  config: modelConfig,
+                });
+
+                let accumulated = '';
+                let chunkCounter = 0;
+                for await (const chunk of responseStream) {
+                  const part = chunk.text ?? '';
+                  if (part) {
+                    accumulated += part;
+                    chunkCounter += 1;
+                    if (chunkCounter % 4 === 0) {
+                      callbacks.onProgress(accumulated.length);
+                    }
+                  }
+                }
+                const candidateText = accumulated.trim();
+                if (candidateText) {
+                  JSON.parse(candidateText);
+                  rawText = candidateText;
+                  break;
+                }
+              } else {
+                const response = await ai.models.generateContent({
+                  model: modelName,
+                  contents: prompt,
+                  config: modelConfig,
+                });
+
+                const candidateText = (response.text ?? '').trim();
+                if (candidateText) {
+                  JSON.parse(candidateText);
+                  rawText = candidateText;
+                  break;
+                }
+              }
+              lastError = new Error('Model mengembalikan respons kosong.');
+            } catch (err: unknown) {
+              lastError = err;
+              console.warn(
+                `Attempt ${attempt}/${maxAttempts} failed for ${modelName}:`,
+                err instanceof Error ? err.message : err
+              );
+              const isSyntax = err instanceof SyntaxError;
+              if (!isTransientError(err) && !isSyntax) {
+                break;
+              }
+              if (attempt < maxAttempts) {
+                callbacks?.onStatus?.(
+                  'Model AI sedang padat, mencoba ulang otomatis...'
+                );
+                await sleep(1000 * attempt);
+              }
+            }
+          }
+          if (rawText) {
+            break;
+          }
+        }
+
+        if (!rawText) {
+          throw lastError ?? new Error('Model tidak mengembalikan output JSON.');
+        }
+
+        return JSON.parse(rawText) as AssessmentPackage;
+      };
+
+      if (asyncMode) {
+        pruneOldJobs();
+        const jobId = crypto.randomUUID();
+        const initialMessage = `Menyusun ${totalRequested} butir soal ${curriculum.mata_pelajaran}...`;
+        const job: AssessmentJob = {
+          id: jobId,
+          status: 'pending',
+          message: initialMessage,
+          chars: 0,
+          createdAt: Date.now(),
+        };
+        assessmentJobs.set(jobId, job);
+
+        void (async () => {
+          try {
+            const parsed = await executeGeneration({
+              onStatus: (msg) => {
+                job.message = msg;
+              },
+              onProgress: (chars) => {
+                job.chars = chars;
+              },
+            });
+            job.package = parsed;
+            job.status = 'done';
+            job.message = 'Paket soal selesai disusun.';
+          } catch (err: unknown) {
+            console.error('Async assessment job failed:', err);
+            const { statusCode, friendlyMessage } = mapFriendlyAiError(err);
+            job.status = 'error';
+            job.statusCode = statusCode;
+            job.error = friendlyMessage;
+          }
+        })();
+
+        res.status(202).json({
+          jobId,
+          status: 'pending',
+          message: initialMessage,
+        });
+        return;
+      }
 
       const writeNdjson = (obj: Record<string, unknown>) => {
         if (stream && !res.writableEnded) {
@@ -458,99 +678,12 @@ Pastikan:
       }
 
       try {
-        for (const modelName of modelsToTry) {
-          const maxAttempts = modelName === 'gemini-4-hydrogen' ? 1 : 2;
-          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-              if (modelName !== modelsToTry[0] && attempt === 1) {
-                writeNdjson({
-                  type: 'status',
-                  message: 'Mengalihkan ke model cadangan yang lebih cepat...',
-                });
-              }
-
-              const modelConfig = {
-                systemInstruction,
-                responseMimeType: 'application/json',
-                responseSchema: ASSESSMENT_RESPONSE_SCHEMA,
-                ...(modelName === 'gemini-4-hydrogen'
-                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-                  : {}),
-              };
-
-              if (stream) {
-                const responseStream = await ai.models.generateContentStream({
-                  model: modelName,
-                  contents: prompt,
-                  config: modelConfig,
-                });
-
-                let accumulated = '';
-                let chunkCounter = 0;
-                for await (const chunk of responseStream) {
-                  const part = chunk.text ?? '';
-                  if (part) {
-                    accumulated += part;
-                    chunkCounter += 1;
-                    if (chunkCounter % 4 === 0) {
-                      writeNdjson({
-                        type: 'progress',
-                        chars: accumulated.length,
-                      });
-                    }
-                  }
-                }
-                const candidateText = accumulated.trim();
-                if (candidateText) {
-                  // Validate complete JSON before breaking out of fallback loop
-                  JSON.parse(candidateText);
-                  rawText = candidateText;
-                  break;
-                }
-              } else {
-                const response = await ai.models.generateContent({
-                  model: modelName,
-                  contents: prompt,
-                  config: modelConfig,
-                });
-
-                const candidateText = (response.text ?? '').trim();
-                if (candidateText) {
-                  JSON.parse(candidateText);
-                  rawText = candidateText;
-                  break;
-                }
-              }
-              lastError = new Error('Model mengembalikan respons kosong.');
-            } catch (err: unknown) {
-              lastError = err;
-              console.warn(
-                `Attempt ${attempt}/${maxAttempts} failed for ${modelName}:`,
-                err instanceof Error ? err.message : err
-              );
-              const isSyntax = err instanceof SyntaxError;
-              if (!isTransientError(err) && !isSyntax) {
-                break;
-              }
-              if (attempt < maxAttempts) {
-                writeNdjson({
-                  type: 'status',
-                  message: 'Model AI sedang padat, mencoba ulang otomatis...',
-                });
-                await sleep(1000 * attempt);
-              }
-            }
-          }
-          if (rawText) {
-            break;
-          }
-        }
-
-        if (!rawText) {
-          throw lastError ?? new Error('Model tidak mengembalikan output JSON.');
-        }
-
-        const parsed = JSON.parse(rawText) as AssessmentPackage;
+        const parsed = await executeGeneration({
+          onStatus: (msg) => writeNdjson({ type: 'status', message: msg }),
+          onProgress: stream
+            ? (chars) => writeNdjson({ type: 'progress', chars })
+            : undefined,
+        });
         if (stream) {
           writeNdjson({ type: 'result', package: parsed });
           res.end();
@@ -565,35 +698,7 @@ Pastikan:
       }
     } catch (error: unknown) {
       console.error('Error generating assessment package:', error);
-      const rawMsg = error instanceof Error ? error.message : String(error);
-
-      let statusCode = 500;
-      let friendlyMessage =
-        'Terjadi kesalahan saat menyusun paket soal dengan layanan AI.';
-
-      if (
-        rawMsg.includes('503') ||
-        rawMsg.includes('UNAVAILABLE') ||
-        rawMsg.includes('high demand')
-      ) {
-        statusCode = 503;
-        friendlyMessage =
-          'Layanan model AI sedang mengalami lonjakan trafik sementara (503). Sistem sudah mencoba ulang otomatis dan berpindah model cadangan—silakan klik "Susun Paket Soal" kembali dalam beberapa detik.';
-      } else if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) {
-        statusCode = 429;
-        friendlyMessage =
-          'Batas kuota permintaan AI sementara tercapai (429). Silakan tunggu sebentar lalu coba lagi, atau periksa kunci API di panel Settings > Secrets.';
-      } else if (
-        rawMsg.includes('API_KEY_INVALID') ||
-        rawMsg.includes('PERMISSION_DENIED') ||
-        rawMsg.includes('403')
-      ) {
-        statusCode = 403;
-        friendlyMessage =
-          'Kunci API tidak valid atau tidak memiliki izin akses. Silakan periksa GEMINI_API_KEY di panel Settings > Secrets.';
-      } else if (rawMsg) {
-        friendlyMessage = rawMsg;
-      }
+      const { statusCode, friendlyMessage } = mapFriendlyAiError(error);
 
       if (res.headersSent) {
         if (!res.writableEnded) {
@@ -606,6 +711,10 @@ Pastikan:
         res.status(statusCode).json({ error: friendlyMessage });
       }
     }
+  });
+
+  app.use('/api/*', (_req, res) => {
+    res.status(404).json({ error: 'Endpoint API tidak ditemukan.' });
   });
 
   if (process.env.NODE_ENV !== 'production') {
